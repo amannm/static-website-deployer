@@ -3,14 +3,14 @@ package com.amannmalik.staticwebsitedeployer;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestStreamHandler;
 
-import javax.json.Json;
-import javax.json.JsonObject;
-import javax.json.JsonReader;
+import javax.json.*;
 import javax.json.stream.JsonParsingException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.StringReader;
+import java.time.Instant;
+import java.util.*;
 
 public class LambdaRequestHandler implements RequestStreamHandler {
 
@@ -21,6 +21,12 @@ public class LambdaRequestHandler implements RequestStreamHandler {
         if (secret == null) {
             throw new RuntimeException("environment variable 'WEBHOOK_SECRET' is required");
         }
+
+        String path = System.getenv("REPOSITORY_PATH");
+        if (path == null) {
+            path = "";
+        }
+
 
         String bucket = System.getenv("DESTINATION_BUCKET");
         if (bucket == null) {
@@ -35,6 +41,7 @@ public class LambdaRequestHandler implements RequestStreamHandler {
         StaticWebsiteDeployer deployer = new StaticWebsiteDeployer();
         deployer.setDestinationBucket(bucket);
         deployer.setDestinationKey(key);
+        deployer.setRepositoryPath(path);
 
         extractPushEvent(input, secret, deployer);
 
@@ -85,6 +92,53 @@ public class LambdaRequestHandler implements RequestStreamHandler {
             throw new RuntimeException("non-master push");
         }
 
+
+        Map<String, TreeMap<Long, String>> changes = new HashMap<String, TreeMap<Long, String>>();
+
+        if (!body.containsKey("commits")) {
+            throw new RuntimeException();
+        }
+        JsonArray commits = body.getJsonArray("commits");
+        if (commits.isEmpty()) {
+            //TODO: not an exception
+            throw new RuntimeException("no commits");
+        }
+        commits.stream().map(v -> (JsonObject) v).forEach(c -> {
+            long timestamp = Instant.parse(c.getString("timestamp")).toEpochMilli();
+            if (c.containsKey("added")) {
+                c.getJsonArray("added").stream().map(v -> (JsonString) v).map(JsonString::getString).forEach(s -> {
+                    changes.computeIfAbsent(s, k -> new TreeMap<>()).put(timestamp, "added");
+                });
+                c.getJsonArray("modified").stream().map(v -> (JsonString) v).map(JsonString::getString).forEach(s -> {
+                    changes.computeIfAbsent(s, k -> new TreeMap<>()).put(timestamp, "modified");
+                });
+                c.getJsonArray("removed").stream().map(v -> (JsonString) v).map(JsonString::getString).forEach(s -> {
+                    changes.computeIfAbsent(s, k -> new TreeMap<>()).put(timestamp, "delete");
+                });
+            }
+        });
+
+        Set<String> deleteFiles = new HashSet<>();
+        Set<String> putFiles = new HashSet<>();
+
+        changes.forEach((k, v) -> {
+            String lastOperation = v.lastEntry().getValue();
+            if ("removed".equals(lastOperation)) {
+                if (v.size() > 1) {
+                    String firstOperation = v.firstEntry().getValue();
+                    if (!"added".equals(firstOperation)) {
+                        deleteFiles.add(k);
+                    } else {
+                        //added and deleted in same push, no change
+                    }
+                } else {
+                    deleteFiles.add(k);
+                }
+            } else {
+                putFiles.add(k);
+            }
+        });
+
         if (!body.containsKey("repository")) {
             throw new RuntimeException();
         }
@@ -98,8 +152,8 @@ public class LambdaRequestHandler implements RequestStreamHandler {
     }
 
     private static boolean validateEvent(String signature, String body, String secret) {
-        //TODO: this
-        return true;
+        SignatureVerifier verifier = new SignatureVerifier(secret);
+        return verifier.verify(body, signature);
     }
 
 
